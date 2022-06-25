@@ -1,0 +1,750 @@
+---
+title: 'Project 3 : Predicting Box Office Sales'
+author: "William Y. VanZytveld"
+date: "`r Sys.Date()`"
+output: html_document
+always_allow_html: true
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = TRUE, message = TRUE) 
+```
+
+```{r, include = FALSE}
+# Preliminary Quickview and Plot Dimension Functions
+quickview <- function(dataset, num){
+  dataset %>% 
+    head(num) %>% 
+    view()
+}
+
+set_plot_dimensions <- function(width_choice, height_choice) {
+        options(repr.plot.width=width_choice, repr.plot.height=height_choice)
+}
+```
+
+# Executive Summary:
+
+To the Line Producer of Company X, 
+
+The following report aims to show what seem to be relevant factors that affect box office sales of a particular movie. We will be using a variety of modeling techniques (Random Forest, Decision Tree, Linear Regression) to aid us in predicting how much a a film will make given the its budget, run time, genre, crew size, year released, and week day released among a host of other variables to consider.
+
+
+A word of caution before we proceed with the development, fine tuning, and interpretation of our models. The models we are about to create will only be as good as the data that is fed into them. Throughout the Exploratory Data Analysis, I will be sure to highlight where the data used to create the model may not be reflective of the true distribution of films released worldwide which made lead our model to overweight particular films.
+
+It is my hope that this report will give you a better understanding of some underlying economic forces that determine a film's box office and help you plan accordingly for your film's budget. Some limitations of this report include the fact that it does not participate in two deeper layers of analysis:
+
+1.) The following models, in the author's opinion lack the nuance in identifying the idea that the creative process and artistic merit a film doesn't always equate to a financial success. This model lacked a variety of metrics for success, mainly using revenue and popularity as a response variables and explanatory variables, respectively. If this analysis and modeling were to be redone with more extensive data, I would aim to include other metrics of success such as rotten tomato scores, and number of award nominations.
+
+2.) A further break down of demographics in the revenue a film generates. The data on film revenue is an aggregate across several demographics and is impossible to determine a complete breakdown by demographics. This layer of analysis would be pertinent to a line producer's job to determine the viability a film project given your specific demographics. For example, a line producer drafting a budget for an independent film in urban New York City will most likely have a different demographic to keep in mind than a blockbuster film in a rural part of Mexico.. This starts to enter the realm of marketing and segmenting for specific customers. 
+
+In other words, the author of this report acknowledges that what the model proposes to be a good formula for a box office hit may not lead to perfectly ethical casting or creative decisions.
+
+But enough with the the opening credits, as they say in the industry:  "Lights, camera, ....action!"
+
+# Libraries
+
+First, let's load the libraries we will be using:
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(lubridate)
+library(robotstxt)
+library(data.table)
+library(gridExtra)
+library(glue)
+library(rpart.plot)
+library(reactable)
+library(naniar)
+message("ABC", "DEF")
+suppressMessages(message("ABC"))
+
+testit <- function() {
+  message("testing package startup messages")
+  packageStartupMessage("initializing ...", appendLF = FALSE)
+  Sys.sleep(1)
+  packageStartupMessage(" done")
+}
+
+testit()
+suppressPackageStartupMessages(testit())
+```
+
+# Data Collection
+
+## Loading CSV Files
+
+The loading and cleaning of the data largely mirrors the process outlined by [Saba Tavoosi](https://www.kaggle.com/code/tavoosi/predicting-box-office-revenue-with-random-forest)
+
+```{r}
+#Loading the Data
+films_train <- read.csv("data/train.csv", na.strings=c("", '#N/A', '[]', '0'))
+films_test <- read.csv("data/test.csv", na.strings=c("", '#N/A', '[]', '0'))
+# quickview(films_train, 5)
+```
+
+## Cleaning CSV Files
+
+```{r}
+# Cleaning function
+clean_data <- function(dataset){
+  data <- dataset %>% 
+  select(-`poster_path`, - `tagline`, - `overview`, `homepage`) %>% #removing variables that won't be considered for further analysis
+  mutate(release_date = parse_date_time2(release_date, "mdy", cutoff_2000 = 20), #ensuring years after 2000 are correctly identified in the right century.
+         release_year = lubridate::year(ymd(release_date)), #grab year from release_date
+         release_month = lubridate::month(ymd(release_date)), #grab month from release_date
+         release_quarter = lubridate::quarter(ymd(release_date)), #grab quarter from release_date
+         release_week = lubridate::week(ymd(release_date)), #grab week number from release_date
+         release_wday = lubridate::wday(ymd(release_date)), #grab weekday from release_date
+         original_language = as.factor(original_language), 
+         is_english = case_when(original_language == "en" ~ "English",
+                              original_language != "en" ~ "Non English"), #new variable of two levels identifying whether it is an english or non-english speaking film.
+         genres = as.factor(genres),
+         main_genre = str_extract(genres, "Comedy|Horror|Action|Drama|Documentary|Science Fiction|
+              Crime|Fantasy|Thriller|Animation|Adventure|Mystery|War|Romance|Music|
+              Family|Western|History|TV Movie|Foreign"), #identifies the main genre of the movie according choosing from the given list
+         status = as.factor(status),
+         series = str_extract(belongs_to_collection, "(?<=name\\'\\:\\s{1}\\').+(?=\\'\\,\\s{1}\\'poster)"),
+         series = ifelse(!is.na(series), as.character(series), "No collection"), # filling NA values with "No Collection"
+         production_companies = gsub('(^\\[\\{\'name\'\\:\\s\'|\'\\,\\s\'id.*)', '',
+                                 production_companies),
+         production_countries = str_extract(production_countries, "[:upper:]+"),
+         top_prod_comp = case_when(production_companies == 'Universal Pictures' ~ 'Universal Pictures',
+                                   production_companies == 'Paramount Pictures' ~ 'Paramount Pictures',
+                                   production_companies == 'Twentieth Century Fox Film Corporation' ~ 'Twentieth Century Fox Film Corporation',
+                                   production_companies == 'Columbia Pictures' ~ 'Columbia Pictures',
+                                   production_companies == 'New Line Cinema' ~ 'New Line Cinema',
+                                   production_companies == 'Warner Bros.' ~ 'Warner Bros.',
+                                   production_companies == 'Walt Disney Pictures' ~ 'Walt Disney Pictures'),
+         top_prod_comp = ifelse(!is.na(top_prod_comp), as.character(top_prod_comp), "Other"), #filling NA values with "Other"
+         is_top_prod_comp = ifelse(top_prod_comp == "Other", "No", "Yes"),
+         part_of_franchise = ifelse(!is.na(series), "Yes", "No"),
+         all_cast_size = str_count(cast, "name"),
+         female_cast_size = str_count(cast, ('gender\'\\:\\s1')),
+         male_cast_size = str_count(cast, ('gender\'\\:\\s2')),
+         all_crew_size = str_count(crew, 'name'),
+         female_crew_size = str_count(crew, ('gender\'\\:\\s1')),
+         male_crew_size = str_count(crew, ('gender\'\\:\\s2')),
+         genre_count = str_count(genres, 'name'),
+         filtered_na = case_when(is.na(budget) ~ "excluded",
+                                 is.na(runtime) ~"excluded",
+                                 is.na(all_cast_size) ~ "excluded",
+                                 is.na(female_cast_size) ~ "excluded",
+                                 is.na(genre_count) ~ "excluded"),
+         filtered_na = ifelse(!is.na(filtered_na), as.character(filtered_na), "included")
+  )
+  first_in_series <- data %>% 
+  filter(!is.na(series)) %>% 
+  arrange(series,
+          release_date) %>% 
+  group_by(series) %>% 
+  slice(1) %>% 
+  mutate(order = "before") %>% 
+  select(imdb_id,
+         order)
+
+data <- data %>% 
+  left_join(first_in_series, by = c("imdb_id" = "imdb_id")) %>%
+  rename(series = series.x) %>% 
+  mutate(order = ifelse(is.na(order), "after", as.character(order))) %>% 
+  select(-c(`id`, `belongs_to_collection`, `homepage`, `imdb_id`, `status`, `title`, `Keywords`, series.y, )) #removing columns impertinent to future modeling.
+
+}
+
+#Cleaning the Data
+films_train <- clean_data(films_train)
+films_test <- clean_data(films_test)
+films_all <- bind_rows(films_train, films_test)
+```
+
+A note about the titles of the data set: The original "test" data set had NA values for revenue as that column was left for modeling to fill in values. However, in order to be able to assess the accuracy of the training on the testing data set (hence, supervised learning), I needed a testing data set that had the "right answer" provided in order to see how far off my models were (Using metrics such as Mean Absolute Error and Mean Absolute Percentage Error). Hence, I decided to split the training data set into a training data set and testing data set.
+
+## Data Cleansing
+
+The data cleansing above consisted of removing three columns that were not of immediate pertinence to this discussion. I ensured the release date would be read as a date with the correct corresponding years. I also created columns to describe what quarter of the year a film was released, used regular expressions to remove gratuitous text in the `belongs_to_collection` and `production_companies` variables, and labeled which films were released by top production companies which include Universal Pictures, Paramount Pictures, Twentieth Century Fox Film Corporation, Columbia Pictures, New Line Cinema, Warner Brothers, and Walt Disney Pictures. I loaded the test data set and training data set separately as that is the form in which I found them and joined them together to create the data set `films_all`. Note, the test data set as expected did not have a `revenue` column as that is the response variable in question so `films_all` will have as many cases where revenue is not available as there are number of cases in the films_test. 
+
+The following plot should illustrate this fact:
+
+```{r}
+films_all %>% 
+  select(revenue) %>% 
+  vis_miss()
+
+quickview(films_train, 100)
+```
+
+It should be noted that the variables `belongs_to_collection`, `genres`, `production_company`, `spoken_languages`, `Keywords`, `cast`, and `crew` were imported as json data. Regular expressions, copied from [Saba Tavoosi](https://www.kaggle.com/code/tavoosi/predicting-box-office-revenue-with-random-forest) have been used to extract information from each column.
+
+
+I have decided to remove gratuitous variables that the author of this report has deemed to have little use for future modeling. For example, `imdb_id` is an identifier column and gives little information about the content of the film. What the ID number may communicate is the age of the film (lower ID numbers may be have been released earlier as more recent films receive higher ID numbers) but the age of the film can be better determined by its `release_year`.
+
+## Data Engineering
+
+I have engineered the following new variables using information from the given columns from the Kaggle data set:
+
+`is_top_prod_comp` : describes if a film was produced by any of the top six production companies (Universal Pictures, Paramount Pictures, Twentieth Century Fox, Columbia Pictures, New Line Cinema, Warner Brothers, and Walt Disney Pictures.) labelled as "Yes". If not, is is labeled as "No". Note the distinction between Twentieth Century Fox and Walt Disney Pictures is permissible as this data set contains films released before Disney's acquisition of Twentieth Century Fox.
+
+`part_of_franchise` : describes if a film is part of a collection, franchise, or has a shared characters existing in other films, labelled as "Yes".If not, labeled as "No".
+
+
+`order`: describes if a film within this data set has another film represented that comes after it in the same collection. The variable `order`has two levels: "before" and "after". Note, since this data set is not a complete list of films and will frequently omit films that started franchises, I have opted to use the vocabulary "before" and "after" to identity within this data set which films have come before other films in the same franchise. The words before and after should not be used synchronously with original and sequel, respectively, as it is quite possible to have a film in this data set be considered the 'first' in its collection but still be a sequel. Also note that due to the filtering join function performed to obtain a list of films that are the "first" in their collection within this data set, the data set will categorize all others as "after" is the only film in the data set. The author and modeler of this report acknowledges the imprecision in this data engineering and encourages the reader to consider this variable to be of little importance in future models.
+
+# Data Exploration
+
+## NA Values
+
+Before we filter out values in preparation for modeling, let's examine which cases we will be removing and if they resemble a pattern. Ideally for the models to be unaffected by the absence of certain cases, we would like to see relative similarity between the density plots of revenue for cases that will be included and cases that we are planning to exclude.
+
+```{r}
+vis_miss(films_train)
+gg_miss_var(films_train)
+
+films_train %>% 
+  ggplot() +
+  aes(x = revenue,
+      fill = filtered_na)+
+  geom_density() +
+  scale_x_log10() #proportions larger revenue values to appear larger.
+```
+
+
+Our density plot clearly shows that removal of our NA values, particularly those in `budget` requires us to alter our interpretation of the model. The fact that the peak of the "excluded" density falls lower in height (density) and in value (revenue) suggests that many of the budgets that were left as NA in the original data set had very low budgets. Our models then adjust to describe films that only reside in the blue shaded area of films in the  "included" portions where the revenue is high. In other words, this model would be more appropriately used for films expected to garner more at the box office than independent films.
+
+We then proceed to filter out the cases in the red shaded areas to be excluded:
+
+```{r}
+films_train <- films_train %>% 
+  filter(!is.na(budget), #filtering in preparation for modeling
+         !is.na(runtime), #filtering in preparation for modeling
+         !is.na(all_cast_size), #filtering in preparation for modeling
+         !is.na(female_cast_size), #filtering in preparation for modeling
+         !is.na(genre_count)) #filtering in preparation for modeling
+```
+
+
+## Exploring the Distribution Across the Calendar Year by Month and Quarter
+
+The following code is taken and reworked from [Saba Tavoosi](https://www.kaggle.com/code/tavoosi/predicting-box-office-revenue-with-random-forest)
+
+
+```{r, fig.width = 10, fig.height = 13}
+# Year released
+year_plot <- films_train %>% 
+  ggplot(aes(x = release_year,
+             y = revenue,
+             color = release_year)) +
+   geom_point() +
+   geom_smooth(method = 'lm', color = 'red3', fill = 'red3') + 
+   scale_y_continuous(breaks = c(0, 500000000, 1000000000, 1500000000),
+                      labels = c('$0', '$500', '$1000', '$1500')) +
+   theme_classic() +
+   theme(legend.position = 'none') +
+   labs(title = 'Revenue by year released', x = 'Release year', y = 'Revenue (Millions)')
+
+# Quarter released
+quarter_plot <- films_train %>% 
+  ggplot(aes(x = factor(release_quarter),
+             y = revenue,
+      fill = factor(release_quarter))) +
+  stat_summary_bin(fun = median, geom = "bar") +
+  scale_y_continuous(breaks = c(0, 10000000, 20000000),
+                      labels = c('$0', '$10', '$20')) +
+   theme_classic() +
+   theme(legend.position = 'none', axis.text.x = element_text(angle = 90)) +
+   labs(title = 'Revenue by quarter released', 
+        x = 'Release quarter', 
+        y = 'Median revenue (Millions)')
+  
+# Month released
+
+month_plot <- films_train %>% 
+  ggplot(aes(x = release_month,
+             y = revenue,
+             fill = release_month)) +
+  stat_summary_bin(fun = median, geom = "bar") +
+   scale_y_continuous(breaks = c(0, 10000000, 20000000, 30000000),
+                      labels = c('$0', '$10', '$20', '$30')) +
+   theme_light() +
+   theme(legend.position = 'none', axis.text.x = element_text(angle = 45)) +
+   labs(title='Median revenue by month released', x='Release month', y='Median revenue (Millions)')
+
+
+# Week released
+week_plot <- films_train %>% 
+  ggplot(aes(x = factor(release_week),
+             y = revenue, 
+             fill = factor(release_week))) +
+  stat_summary_bin(fun = median, geom = "bar") +
+   scale_y_continuous(breaks = c(0, 20000000, 40000000, 60000000),
+                      labels = c('$0', '$20', '$40', '$60')) +
+   theme_light() +
+   theme(legend.position = 'none', axis.text.x = element_text(angle = 90)) +
+   labs(title='Revenue by week released', x='Release week', y='Median revenue (Millions)')
+
+# Weekday released
+weekday_plot <- films_train %>% 
+  ggplot(aes(x = release_wday, 
+             y = revenue,
+             fill = release_wday)) +
+   stat_summary_bin(fun = median, geom = "bar") + 
+   scale_y_continuous(breaks = c(0, 10000000, 20000000, 30000000),
+                      labels = c('$0', '$10', '$20', '$30')) +
+   theme_light() +
+   theme(legend.position = 'none', axis.text.x = element_text(angle = 45)) +
+   labs(title = 'Revenue by weekday released', x='Release day', y='Median revenue (Millions)')
+
+# Create a grid of the plots.
+grid.arrange(year_plot, quarter_plot, month_plot, weekday_plot, week_plot,
+             layout_matrix = rbind(c(1, 2, 3),
+                                   c(5, 5, 4)))
+```
+
+## Distribution of Films across Years:
+
+The following code is taken from [Saba Tavoosi](https://www.kaggle.com/code/tavoosi/predicting-box-office-revenue-with-random-forest)
+
+```{r, fig.width = 7, fig.height = 6.6}
+columnchart_by_year <- function(dataset, color){
+  dataset %>%
+  select(-revenue) %>% 
+  group_by(release_year) %>% 
+  count() %>% 
+  ggplot() + 
+  aes(x = release_year,
+      y = n,
+      fill = release_year) +
+  geom_col(fill = color) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(title = "Distribution of Released Films",
+       subtitle = "by Release Year",
+       x = "Year", 
+       y = "Number of Films",
+       caption = "Source: kaggle")
+}
+```
+
+```{r, fig.width = 7, fig.height = 6.6}
+films_train %>%
+  group_by(release_year) %>% 
+  count() %>% 
+  arrange(desc(n)) %>%
+  head(5)
+
+films_train %>%
+  group_by(release_year) %>% 
+  count() %>% 
+  arrange(release_year) %>% 
+  head(5)
+
+year_column_chart_train <- columnchart_by_year(films_train, "lightcyan3")
+year_column_chart_test <- columnchart_by_year(films_train, "lightcyan3")
+year_column_chart_all <- columnchart_by_year(films_all, "lightcyan4")
+
+grid.arrange(year_column_chart_train,
+             year_column_chart_test,
+             year_column_chart_all,
+             nrow = 1)
+```
+
+The most popular years for a film in our data set to be released were 2013, 2014, and 2015 with 335, 320, and 312 films respectively. Our data set only had 1 film coming from 1923, 1924, 1929, 2018, 2021. We have a skewed left distribution of films across the years with the earliest coming from 1923 and the most recent from 2018.
+
+
+I have reservations about how this training data set mirrors the distribution of films in the real world. It appears that this data set has an oversampling bias for the early 2000's. For example, Allen J Scott has found a more even [distribution of films](https://www.researchgate.net/figure/Number-of-new-feature-films-released-annually-in-the-US-since-1945-Published-data-on_fig1_233132735) than the spike depicted in our data set. This data set also does not feature many releases from 2021 and 2022, thereby creating a distribution that poorly resembles the findings of [Statista](https://www.statista.com/statistics/187122/movie-releases-in-north-america-since-2001/#:~:text=Movie%20releases%20in%20the%20U.S.%20%26%20Canada%202000%2D2021&text=In%202021%2C%20a%20total%20of,before%20the%20COVID%2D19%20outbreak.) For example, I find it concerning that this data set doesn't contain films from the most recent years, especially as these films may contain information related to the pandemic's tumultuous effect on the film industry. In other words, the absence of these films from more recent years may potentially underestimate the effect the pandemic has had on future films. If the data set does contain films in more recent years, I would intend to engineer a new variable that classifies  film as  "pre-pandemic", "immediately post-pandemic films" (i.e. films released one year of March 10, 2020) and "late post-pandemic films" (i.e. films released after March 10, 2022.).
+
+## Exploring patterns and profitability with Budget:
+
+The following code is taken from [Saba Tavoosi](https://www.kaggle.com/code/tavoosi/predicting-box-office-revenue-with-random-forest)
+
+```{r echo=FALSE}
+# Budget
+films_train %>% 
+  ggplot(aes(x = budget, 
+             y = revenue, 
+             color = budget)) +
+  geom_point() +
+  geom_smooth(method = 'gam',
+              color = "black", 
+              fill = 'gray') +
+  # scale_x_log10()
+  scale_y_continuous(breaks = c(0, 500000000, 1000000000, 1500000000),
+                      labels = c('$0', '$500', '$1000', '$1500')) +
+  scale_x_continuous(breaks = c(0, 50000000, 100000000, 200000000, 300000000), 
+                      labels = c('$0', '$50', '$100', '$200', '$300')) +
+   theme_classic() +
+   theme(legend.position = 'none') +
+   labs(title = 'Revenue by budget', x = 'Budget (Millions)', y = 'Revenue (Millions)')
+```
+
+While not too many observations can be drawn from this preliminary graph, one can see how in general, a higher budget film may lead to higher revenue. This is of course a trend with many opportunities to show a high budget film with a low revenue and vice versa. 
+
+## Counts and Box Office Sales By Genre:
+
+The following code is taken from [Saba Tavoosi](https://www.kaggle.com/code/tavoosi/predicting-box-office-revenue-with-random-forest)
+
+```{r out.width=c('50%', '50%'), fig.show='hold', echo=FALSE}
+# Movie counts by main genre
+films_train %>% 
+  ggplot() +
+  aes(x = fct_infreq(main_genre),
+      fill = main_genre) +
+  geom_bar() +
+  theme_bw() +
+  coord_flip() +
+  theme(legend.position = 'none') + 
+  labs(title = 'Genre by count', x = 'Genre', y = 'count')
+
+#Boxplot per Genre
+
+films_train %>% 
+  ggplot(aes(x = fct_infreq(main_genre),
+             y = revenue,
+             fill = main_genre)) +
+  stat_summary() +
+  coord_flip() +      
+  scale_y_continuous(breaks = c(0, 50000000, 100000000, 200000000),
+                      labels = c('$0', '$50', '$100', '$200')) +
+  coord_flip() +
+  theme_classic() +
+  theme(legend.position = 'none') +  
+  labs(title = 'Median revenue by genre', x = 'Genre', y = 'Median revenue (Millions)')
+```
+
+The bar plot above shows that Drama, Comedy, and Action were the most popular film releases in our data set. On the other end of the spectrum, Foreign films, History, and Western were the last popular. It should be noted that the classifications of genre may, out of simplification, choose drama and comedy as they are typically the dominant genre to describe a film. For example, a murder comedy mystery may be classified as a comedy. A further analysis could break these genres into further subsets and capture the nuances of more specified genres and how it affect `revenue`.
+
+The second plot shows a five number summary (Min, Q1, Median, Q3, Max) breakdown by Genre. We can observe that Science Fiction has a wide distribution whereas as Adventure, with a smaller distance between their minimum and maximum values, generally performs the best out of all the other genres. On the other end, we see that Documentary films and foreign films on average, tend to have the lowest box office sales when compared to other genres. 
+
+## Comparing Box Office Sales between the top production companies
+
+The following code is taken from [Saba Tavoosi](https://www.kaggle.com/code/tavoosi/predicting-box-office-revenue-with-random-forest)
+
+```{r,echo=FALSE}
+#Place this in the clean dataset
+films_train %>% 
+  filter(!is.na(top_prod_comp)) %>% 
+  ggplot() +
+  aes(x = top_prod_comp,
+      y = revenue, 
+      fill = top_prod_comp) +
+  geom_boxplot() +
+  scale_y_continuous(breaks = c(0, 500000000, 1000000000, 1500000000),
+                      labels = c('$0M', '$500', '$1000', '$1500')) +
+   coord_flip() +
+   theme_classic() + 
+   theme(legend.position = 'none') +
+   labs(title = 'Revenue by top production companies',
+        x = 'Top production companies', y = 'Revenue (Millions)')
+```
+
+When broken down by Production Companies, we see that Walt Disney seems to outperform its competitors with the highest median and Q3. While Universal Pictures and Paramount Pictures may have a smattering of films that have higher box office sales than Walt Disney highest grossing film, the body of these two company s' inner quartile range is solidly lower than Disney median.
+
+However, the author of this report suggests the reader to apply the results of this boxplot *only to the data set* available. For example, it is evident that Walt Disney has produced a number of top grossing films but are not represented in some of the largest outliers. For example, from this plot, I was able to confirm that this box plot does not include [Avatar](https://en.wikipedia.org/wiki/Avatar_(2009_film)) or [Avengers:Endgame](https://en.wikipedia.org/wiki/Avengers:_Endgame) the highest and second [highest grossing films of all time](https://www.boxofficemojo.com/chart/top_lifetime_gross/?area=XWW), respectively.
+
+## Revenue by Year
+
+The following code is taken from [Saba Tavoosi](https://www.kaggle.com/code/tavoosi/predicting-box-office-revenue-with-random-forest)
+
+```{r}
+films_train %>%
+  group_by(release_year) %>% 
+  summarize(average_boxoffice = mean(revenue)) %>% 
+  ggplot() + 
+  aes(x = release_year,
+      y = average_boxoffice) +
+  geom_col() +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(title = "Average Box Office Sales ",
+       subtitle = "by Release Year",
+       x = "Year", 
+       y = "Average Box Office Sales",
+       caption = "Source: kaggle, trained data")
+```
+
+As predicted, with a combination of more volume increase and inflation, the overall average box office sales per year has increased  since 1925 according to our data. The revenue values do not account for inflation.
+
+## Sequel or Not:
+
+```{r}
+# Movie Count by Sequel Stats
+films_train %>% 
+  ggplot() +
+  aes(x = fct_infreq(order),
+      fill = order) +
+  geom_bar() +
+  theme_bw() +
+  coord_flip() +
+  theme(legend.position = 'none') + 
+  labs(title = 'Genre by count', x = 'Genre', y = 'count')
+
+# Revenue against Order of film in franchise
+
+films_train %>% 
+  ggplot(aes(x = order,
+             y = revenue)) +
+  geom_boxplot()
+```
+
+Our results indicate that our dataset contained more films classified  as "after" but films classified as "before" overall performed better at the box office as depicted in the boxplot.
+
+#Initial Modeling
+
+## Splitting Test and Train Data Sets
+
+
+For the purposes of supervised modeling, I have decided to use only the testing data and split it further into training and testing. In this way, I will be able to evaluate the accuracy of my model in a supervised manner and calculate error metrics for my test data.
+
+The top 5 cases for the training set are listed below:
+
+```{r}
+set.seed(1) 
+film_split <- initial_split(films_train, prop = 9/10)
+train <- training(film_split)
+test <- testing(film_split) 
+  # filter(!is.na(genre_count))
+
+set.seed(616)
+film_resamples <- vfold_cv(train, v = 5)
+
+
+train %>% 
+  head(5) %>% 
+  select(original_title,
+         budget,
+         popularity,
+         production_companies,
+         release_date,
+         runtime,
+         revenue) %>% 
+  reactable(filterable = TRUE,
+            searchable = TRUE,
+            minRows = 5)
+```
+
+
+## Random Forest
+
+Our first model to test will be a random forest.
+
+The following code is taken from [Saba Tavoosi](https://www.kaggle.com/code/tavoosi/predicting-box-office-revenue-with-random-forest)
+
+```{r}
+library(randomForest)
+library(plotly)
+
+glue("There are {nrow(films_train)} observations in the training set and {nrow(films_test)} observations in the testing set.")
+
+film_formula <- revenue ~ budget + original_language + popularity + production_companies + production_countries + release_date + runtime + release_year + release_month + release_quarter + release_week + release_wday + is_english + main_genre + series + is_top_prod_comp + part_of_franchise + all_cast_size + female_cast_size + male_cast_size + all_crew_size + female_crew_size + male_crew_size + genre_count + order
+
+
+set.seed(131)
+rf_model1 <- randomForest(film_formula,
+                         train,
+                         ntree= 550,
+                         na.action = NULL,
+                         replace = TRUE,
+                         nodesize = 5,
+                         importance = TRUE,
+                         type = "Regression")
+```
+
+This initial random forest model can explain 72.85% of the variance in the model. It used 550 trees and had 8 variables at each split. It was classified as a regression. 
+
+It appears from our results that budget, runtime, and popularity had the largest amount of importance given in this model. To extrapolate even further using our graph from our EDA, it appears that the more one spends on a film, the more it is expected to earn at the box office.
+
+## Linear Regression, Decision Tree, Random Forest
+
+I proceed to create three new models: A linear regresssion, decision tree, and a second random forest model. These three models will use the same formula with the same explanatory variables.
+
+### Linear Regression 
+
+```{r}
+film_formula1 <- revenue ~ budget + popularity + production_companies + release_date + runtime + release_year + release_month + release_quarter + release_week + release_wday + is_english + is_top_prod_comp
+linreg_recipe1 <- recipe(
+  film_formula1,
+  data = train) %>% 
+  step_other(production_companies)
+
+linreg_workflow3 <- workflow(
+  preprocessor = linreg_recipe1,
+  spec = linear_reg()
+)
+
+linreg_fit1 <- fit(linreg_workflow3, data = train)
+
+model1_samples <- fit_resamples(linreg_workflow3,
+                                resamples = film_resamples,
+                                metrics = metric_set(mae))
+
+
+model1_samples %>%
+  collect_metrics(summarize = TRUE)
+```
+
+My reasoning in including as many variables as possible is to allow machine to determine which variables to consider more important. 
+
+### Decision Tree and Second Random Forest Model
+
+#### Fitting Models
+
+```{r}
+formula1 <- revenue ~ budget + popularity + release_date + runtime + release_year + release_month + release_quarter + release_week + release_wday + all_cast_size + female_cast_size + male_cast_size + genre_count
+
+#creating a function to fit a model given a the model type.
+fit_model <- function(type){
+  model_formula <- formula1
+  spec <- type(mode = "regression")
+name <- fit(
+  spec,
+  model_formula,
+  data = train) 
+  
+name
+}
+
+
+dectree_recipe <- recipe(formula1,
+                         data = train)
+
+
+  
+dectree_workflow <- workflow(
+  preprocessor = dectree_recipe,
+  spec = decision_tree(mode = "regression",
+                       tree_depth = 6)
+)
+
+
+#allowing for decision tree to go deeper--> see ensembles tutorials tuning slides.
+
+randforest_recipe <- recipe(
+  formula1,
+  data = train) %>% 
+  step_normalize(all_numeric_predictors())
+  
+randforest_workflow <- workflow(
+  preprocessor = randforest_recipe,
+  spec = rand_forest(mode = "regression")
+)
+
+
+#Fitting Models
+linear_model1 <- fit_model(linear_reg)
+dt_model <- fit(dectree_workflow, data = train)
+rf_model <- fit(randforest_workflow, data = train)
+```
+
+#### Importance Plot (rf_model1) and Decision Tree Plot (dt_model)
+
+```{r}
+# Importance Plot of rf_model1
+importance <- importance(rf_model1)
+varImportance <- data.frame(Variables = row.names(importance), 
+                            Importance = round(importance[,'IncNodePurity'], 0))
+
+ggplotly(ggplot(varImportance, aes(x = reorder(Variables, Importance), 
+                           y = Importance, fill = Importance)) +
+       geom_bar(stat='identity') + 
+       labs(title = 'Importance of predictors', x = 'Predictors', y = 'rmsle') +
+       coord_flip() + 
+       theme_light())
+
+#Decision Tree Plot
+dt_model %>%
+  extract_fit_engine() %>% 
+  rpart.plot(roundint = FALSE, digits = 3, type = 5)
+```
+
+#### Interpretation of Importance Plot and Decision Tree:
+
+Our importance plot using our *first* random forest model (`rf_model1`) communicates that the model saw a higher correlation with budget to revenue than any other variable and proceeded to weight it more than the other variables. Prior to this model, I had already discarded variables I decided would be ineffective or irrelevant and risk worsening the model (i.e. `imbd_id`). 
+
+Our Decision Tree plot confirms the importance of `budget`, `runtime` and the `popularity` in predicting a film's `revenue`. We find that our decision tree model first split on budget, with large majority of films having been produced with a budget under 275 million dollars. We notice an overall pattern where films on the right side of the decision tree plot that have been categorized as having a budget over 275 million dollars have predictor values in their terminal nodes that are higher than the terminal node values on the left hand side. 
+
+## Accuracy Metrics
+
+Consider
+
+```{r}
+# MAE Error Metric Function given one of the fitted models
+mae_error_metrics <- function(model){
+  augment(model, test) %>% 
+    mae(truth = revenue, estimate = .pred)
+}
+
+# MAPE Error Metric Function given one of the fitted models
+mape_error_metrics <- function(model){
+  augment(model, test) %>% 
+    mape(truth = revenue, estimate = .pred)
+}
+
+# Lists MAE and MAPE error metrics for 3 models.
+list_error_metrics <- function(model1, model2, model3){
+  list(mae_error_metrics(model1),
+       mae_error_metrics(model2),
+       mae_error_metrics(model3),
+       mape_error_metrics(model1),
+       mape_error_metrics(model2),
+       mape_error_metrics(model3))
+}
+
+# list_error_metrics(linear_model1,
+#                    dt_model,
+#                    rf_model)
+
+#consider imputing variables as well.
+# as you filter out budget (i.e. small budget), note how that affects the model.
+
+pred_vs_obs <- function(model, subtitle){
+  augment(model, train) %>%
+  ggplot(aes(x = revenue, y = .pred, color = is_top_prod_comp)) +
+  geom_point(alpha = .5) +
+  coord_obs_pred() +
+  geom_abline() +
+  labs(title = "Predicted v. Observed Scatterplot",
+       subtitle = subtitle,
+       x = "Observed",
+       y = "Predicted",
+       color = "Top Production Company")
+} #function to create a predicted v. observed plot
+
+pred_vs_obs(linear_model1, "linear regression")
+pred_vs_obs(dt_model, "decision tree")
+pred_vs_obs(rf_model, "random forest")
+```
+
+The following code is taken from [Saba Tavoosi](https://www.kaggle.com/code/tavoosi/predicting-box-office-revenue-with-random-forest)
+
+```{r}
+glue("We have obatined a mean aboslute error of {mae_error_metrics(linear_model1)[3]}, {mae_error_metrics(dt_model)[3]}, and {mae_error_metrics(rf_model)[3]} for our linear regression, decission tree regression, and random forest regreesion models, respectively.")
+
+glue("We have obatined a mean aboslute percentage error of {mape_error_metrics(linear_model1)[3]}, {mape_error_metrics(dt_model)[3]}, and {mape_error_metrics(rf_model)[3]} for our linear regression, decission tree regression, and random forest regreesion models, respectively.")
+```
+
+
+### Interpretation of Error Metrics and Predicted v. Observed Plots:
+
+Our findings show that our 'best' model with the lowest range of error (MAE) was the second random forest model, though even this model could be improved.
+
+In our Predicted v. Observed plots, we can confirm that our second random forest model performed the best as many of the data points fell close to the diagonal black line. A perfect fit would have all data points lined up on the diagonal black line signifying that the predicted value is the same as the observed value. This was not apparent in the linear regression model and especially not in the decision tree model. In both the linear regression model and our second random forest model, we noticed that the model would start to underestimate the film's revenue with larger budgets. 
+
+
+# Conclusions:
+
+## Models
+
+Given the instances in the discrepancy between the films represented in the data set used to create our four models and the total number of films, I would advise the reader to limit their applications of these models on other films.
+
+The results of the models, particularly the random forest and decision tree models indicate that a larger budget, in general, results in a larger box office return (`revenue`).  Other important factors to consider are the popularity of films. This, however, is unhelpful to a line producer as this data point is recorded after the release of a film where the budget has already been finalized. One way to work with this data is to examine more closely the content of your upcoming film and how it may compare to your previous popular films within your . It is apparent and confirmed in these particular models that people are more willing to see more popular films so it is advisable to produce a film that mirrors successful models. However, this model fails to capture the value of originality which affects the popularity of a film (i.e. Everything Everywhere All At Once, an innovative film and largest grossing film for A24).
+
+## Strengths of Trained Data Set:
+
+While I have been critical of the representation of the data, I commend the data set for having including detailed information about each film that would be able to add nuance to the model. In other words, while the data set may be lacking in quality of the rows, it compensates with the quality of the columns. However, there still exists a multitude of other factors that can be strong determinants a box office success. 
+
+## Weakenesses of Trained Data Set:
+
+As iterated in the executive summary, I hold reservations from solely using this model in your exploration. Consider other models that are able to process film data about differentiating creative inputs (i.e. Directors, use of color palette, cinematographers, level of profanity/nudity/thematic content) that will affect the quality of the film and its likelihood to be well received by your specific demographics for whom the film was marketed. Consider also the ethical implications that this model fails to address. Consider the legal ramifications if the casting decides show gender bias based on the evidence of this model.
+
+
+
+
