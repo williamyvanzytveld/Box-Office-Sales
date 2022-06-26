@@ -1,5 +1,6 @@
 ---
-title: 'Project 3 : Predicting Box Office Sales'
+title: 'Future Box Office Sales'
+subtitle: 'Using Predictive Analytics and Kaggle Data Set to predict future Box Office Sales' 
 author: "William Y. VanZytveld"
 date: "`r Sys.Date()`"
 output: html_document
@@ -418,7 +419,7 @@ I have reservations about how this training data set mirrors the distribution of
 
 The following code is taken from [Saba Tavoosi](https://www.kaggle.com/code/tavoosi/predicting-box-office-revenue-with-random-forest)
 
-```{r echo=FALSE}
+```{r}
 # Budget
 films_train %>% 
   ggplot(aes(x = budget, 
@@ -553,7 +554,7 @@ films_train %>%
 
 Our results indicate that our dataset contained more films classified  as "after" but films classified as "before" overall performed better at the box office as depicted in the boxplot.
 
-#Initial Modeling
+# Initial Modeling
 
 ## Splitting Test and Train Data Sets
 
